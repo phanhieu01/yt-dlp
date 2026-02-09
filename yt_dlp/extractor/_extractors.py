@@ -855,6 +855,7 @@ from .instagram import (
     InstagramUserIE,
 )
 from .internazionale import InternazionaleIE
+from .threads import ThreadsIE
 from .internetvideoarchive import InternetVideoArchiveIE
 from .iprima import (
     IPrimaCNNIE,
