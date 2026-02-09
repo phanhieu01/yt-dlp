@@ -1,4 +1,5 @@
 import json
+import re
 
 from .instagram import InstagramBaseIE
 from ..utils import (
@@ -6,6 +7,7 @@ from ..utils import (
     int_or_none,
     str_or_none,
     traverse_obj,
+    unescapeHTML,
     url_or_none,
 )
 
@@ -47,6 +49,118 @@ class ThreadsIE(InstagramBaseIE):
             'Origin': 'https://www.threads.net',
             'Referer': 'https://www.threads.net/',
             'Accept': '*/*',
+        }
+
+    def _extract_all_media_from_html(self, webpage):
+        """Extract all media URLs from HTML page"""
+        urls = set()
+
+        # 1. Open Graph images (multiple variants may exist)
+        og_images = re.findall(r'<meta[^>]*property=["\']og:image["\'][^>]*content=["\']([^"\']+)["\']', webpage)
+        urls.update(og_images)
+
+        # 2. Open Graph image:url variants
+        og_image_urls = re.findall(r'<meta[^>]*property=["\']og:image:url["\'][^>]*content=["\']([^"\']+)["\']', webpage)
+        urls.update(og_image_urls)
+
+        # 3. Open Graph image:secure_url variants
+        og_secure_urls = re.findall(r'<meta[^>]*property=["\']og:image:secure_url["\'][^>]*content=["\']([^"\']+)["\']', webpage)
+        urls.update(og_secure_urls)
+
+        # 4. Twitter images
+        twitter_images = re.findall(r'<meta[^>]*name=["\']twitter:image["\'][^>]*content=["\']([^"\']+)["\']', webpage)
+        urls.update(twitter_images)
+
+        # 5. Twitter image:src variants
+        twitter_src = re.findall(r'<meta[^>]*name=["\']twitter:image:src["\'][^>]*content=["\']([^"\']+)["\']', webpage)
+        urls.update(twitter_src)
+
+        # 6. Preload images/videos (from <link rel="preload">)
+        # Match: <link rel="preload" as="image" href="...">
+        preload_urls = re.findall(
+            r'<link[^>]*rel=["\']preload["\'][^>]*href=["\']([^"\']*\.(?:jpg|jpeg|png|webp|mp4)[^"\']*)["\']',
+            webpage,
+            re.IGNORECASE
+        )
+        urls.update(preload_urls)
+
+        # 7. All Instagram CDN URLs (scontent, instagram.fsgn, instagram.fna, etc.)
+        # Match URLs from Instagram CDN that point to media files
+        cdn_urls = re.findall(
+            r'(https://(?:scontent|instagram\.[^./"\']*\.fna|instagram\.[^./"\']*\.fbcdn|[^./"\']*\.cdninstagram)[^"\'<>\s]*?\.(?:jpg|jpeg|png|webp|mp4)[^"\'<>\s]*)',
+            webpage,
+            re.IGNORECASE
+        )
+        urls.update(cdn_urls)
+
+        # 8. Look for URLs in preload section (common pattern)
+        preload_section = re.findall(
+            r'"preload":\s*\[{([^\]]+(?:,\s*[^\]]+)*)\}',
+            webpage
+        )
+        for match in preload_section:
+            # Extract URLs from JSON array
+            url_matches = re.findall(r'"([^"]*\.(?:jpg|jpeg|png|webp|mp4)[^"]*)"', match)
+            urls.update(url_matches)
+
+        # Filter unique and valid URLs
+        media_urls = []
+        seen = set()
+        for url in urls:
+            # Unescape HTML entities (&amp; -> &)
+            url = unescapeHTML(url)
+
+            # Unescape URLs (handle \/ -> /)
+            url = url.replace('\\/', '/')
+
+            # Validate URL
+            if url and url.startswith('http') and url_or_none(url):
+                # Remove query parameters for deduplication (keep the original URL)
+                url_for_dedup = re.sub(r'[?&].*', '', url)
+                if url_for_dedup not in seen:
+                    seen.add(url_for_dedup)
+                    media_urls.append(url)
+
+        return media_urls
+
+    def _create_playlist_result(self, post_id, title, description, media_urls, url):
+        """Create a playlist result from multiple media URLs"""
+        entries = []
+
+        for idx, media_url in enumerate(media_urls):
+            # Detect extension from URL
+            if '.mp4' in media_url.lower():
+                ext = 'mp4'
+                format_type = 'video'
+            elif '.webp' in media_url.lower():
+                ext = 'webp'
+                format_type = 'photo'
+            elif '.png' in media_url.lower():
+                ext = 'png'
+                format_type = 'photo'
+            else:
+                ext = 'jpg'
+                format_type = 'photo'
+
+            entries.append({
+                'id': f'{post_id}_{idx + 1}',
+                'title': f'{title} - Media {idx + 1}' if title else f'Media {idx + 1}',
+                'formats': [{
+                    'url': media_url,
+                    'format_id': f'{format_type}_{idx + 1}',
+                    'ext': ext,
+                    'http_headers': {
+                        'Referer': 'https://www.threads.net/',
+                    },
+                }],
+            })
+
+        return {
+            '_type': 'playlist',
+            'id': post_id,
+            'title': title,
+            'description': description,
+            'entries': entries,
         }
 
     def _fetch_post_data(self, url, post_id):
@@ -99,17 +213,25 @@ class ThreadsIE(InstagramBaseIE):
         description = self._og_search_description(webpage)
         title = self._og_search_title(webpage) or description or f'Post by {username}'
 
-        if not thumbnail:
+        # Extract ALL media URLs for carousel support
+        all_media_urls = self._extract_all_media_from_html(webpage)
+
+        if not all_media_urls:
             raise ExtractorError('Could not extract any media from Threads page')
 
-        # Return a basic info dict with the thumbnail as the only downloadable media
+        # If multiple URLs found, return as playlist
+        if len(all_media_urls) > 1:
+            self.report_warning(f'Found {len(all_media_urls)} media items in carousel')
+            return self._create_playlist_result(post_id, title, description, all_media_urls, url)
+
+        # Single media - return standard info dict
         return {
             'id': post_id,
             'title': title,
             'description': description,
             'thumbnail': thumbnail,
             'formats': [{
-                'url': thumbnail,
+                'url': all_media_urls[0],
                 'format_id': 'og_image',
                 'ext': 'jpg',
                 'http_headers': {
@@ -272,6 +394,10 @@ class ThreadsIE(InstagramBaseIE):
 
         # If _fetch_post_data returned a complete info dict (Open Graph fallback), return it directly
         if 'formats' in result and isinstance(result.get('formats'), list):
+            return result
+
+        # If _fetch_post_data returned a playlist (carousel from HTML), return it directly
+        if result.get('_type') == 'playlist':
             return result
 
         # Extract media formats (video/image)
