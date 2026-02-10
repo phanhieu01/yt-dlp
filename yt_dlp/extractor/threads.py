@@ -103,6 +103,47 @@ class ThreadsIE(InstagramBaseIE):
             url_matches = re.findall(r'"([^"]*\.(?:jpg|jpeg|png|webp|mp4)[^"]*)"', match)
             urls.update(url_matches)
 
+        # 9. NEW: Extract video URLs from JSON objects
+        # Pattern: "video_url": "https://..."
+        video_urls = re.findall(
+            r'"video_url"\s*:\s*"((?:https?:)?//[^"]*\.(?:mp4|m4v|mov)[^"]*)["\']',
+            webpage
+        )
+        urls.update(video_urls)
+
+        # 10. Pattern: {"url": "https://...mp4", ...} in video_versions array
+        # Look for entire video_versions array
+        video_versions_blocks = re.findall(
+            r'"video_versions"\s*:\s*(\[[^\]]+\])',
+            webpage
+        )
+        for block in video_versions_blocks:
+            # Extract all "url" values from this array
+            urls.update(re.findall(r'"url"\s*:\s*"([^"]*\.(?:mp4|m4v|mov)[^"]*)"', block))
+
+        # 11. Pattern: Preload video objects with type="video"
+        preload_videos = re.findall(
+            r'\{\s*"type"\s*:\s*"video"[^}]*"url"\s*:\s*"([^"]+)"',
+            webpage
+        )
+        urls.update(preload_videos)
+
+        # 12. Pattern: Generic "url": "..." that ends with video extension
+        # Be careful to avoid false positives - only match https URLs with video extensions
+        generic_video_urls = re.findall(
+            r'"url"\s*:\s*"((?:https?:)//[^"]*\.(?:mp4|m4v|mov)(?:\?[^"]*)?)"',
+            webpage
+        )
+        urls.update(generic_video_urls)
+
+        # 13. Pattern: Android video URLs in media config
+        # Look for video URLs in various config patterns
+        config_videos = re.findall(
+            r'"video"\s*:\s*\{[^}]*"url"\s*:\s*"([^"]+)"',
+            webpage
+        )
+        urls.update(config_videos)
+
         # Filter unique and valid URLs
         media_urls = []
         seen = set()
@@ -123,24 +164,33 @@ class ThreadsIE(InstagramBaseIE):
 
         return media_urls
 
+    def _get_media_info_from_url(self, url):
+        """Determine media type and extension from URL"""
+        url_lower = url.lower()
+
+        # Check for video extensions (with or without query params)
+        for ext in ['mp4', 'm4v', 'mov', 'avi', 'mkv']:
+            if f'.{ext}' in url_lower or f'{ext}?' in url_lower:
+                return ext, 'video'
+
+        # Check for image extensions
+        if '.webp' in url_lower:
+            return 'webp', 'photo'
+        elif '.png' in url_lower:
+            return 'png', 'photo'
+        elif '.gif' in url_lower:
+            return 'gif', 'photo'
+        elif '.jpeg' in url_lower:
+            return 'jpg', 'photo'
+        else:
+            return 'jpg', 'photo'
+
     def _create_playlist_result(self, post_id, title, description, media_urls, url):
         """Create a playlist result from multiple media URLs"""
         entries = []
 
         for idx, media_url in enumerate(media_urls):
-            # Detect extension from URL
-            if '.mp4' in media_url.lower():
-                ext = 'mp4'
-                format_type = 'video'
-            elif '.webp' in media_url.lower():
-                ext = 'webp'
-                format_type = 'photo'
-            elif '.png' in media_url.lower():
-                ext = 'png'
-                format_type = 'photo'
-            else:
-                ext = 'jpg'
-                format_type = 'photo'
+            ext, format_type = self._get_media_info_from_url(media_url)
 
             entries.append({
                 'id': f'{post_id}_{idx + 1}',
